@@ -132,6 +132,20 @@ static inline void wasmkit_tc_start(
 ) {
   exec(sp, pc, md, ms, 0, 0.0, state);
 }
+
+/// A handler that ends the chain: the root frame's `endOfExecution`, in an
+/// execution that returns to the host, continues here, and the handler that
+/// started the chain returns with nothing recorded, rather than through a
+/// thrown error the loop has to box, record and cast on every call.
+static WASMKIT_TC_CC void wasmkit_tc_halt(
+    uint64_t *WASMKIT_NONNULL sp, Pc pc, Md md, Ms ms, uint64_t ireg, double freg,
+    WASMKIT_TC_CONTEXT void *WASMKIT_NULLABLE state
+) {}
+
+/// `wasmkit_tc_halt` as a code slot.
+static inline uint64_t wasmkit_tc_halt_slot(void) {
+  return (uint64_t)(uintptr_t)&wasmkit_tc_halt;
+}
 #endif
 
 int wasmkit_address_sanitizer_enabled(void);

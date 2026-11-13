@@ -114,7 +114,12 @@ bool wasmkit_trap_guard_run(wasmkit_trap_guard_fn fn, void *ctx) {
   wasmkit_trap_guard_t *previous_guard = wasmkit_current_trap_guard;
 
   wasmkit_current_trap_guard = &guard;
-  int jmp = sigsetjmp(guard.env, 1);
+  // No signal mask to save: the handler is installed with SA_NODEFER, so a
+  // trap jumps back with the mask it found, and saving it (and, on Darwin,
+  // the alternate signal stack) costs two system calls on every entry into
+  // the guest, which a host calling in often (re-entrantly, from native
+  // code compiled from another module) pays on each call.
+  int jmp = sigsetjmp(guard.env, 0);
   if (jmp == 0) {
     fn(ctx);
     wasmkit_current_trap_guard = previous_guard;
