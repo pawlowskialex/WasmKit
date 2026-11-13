@@ -171,6 +171,31 @@ public struct Function: Equatable {
         return try handle.invoke(arguments, store: store, stack: &stack)
     }
 
+    /// Invokes the function with its arguments and results as raw 64-bit
+    /// slots (an i32 or f32 in the low bits, zero-extended; an i64 or f64 as
+    /// is), on a stack the caller owns: without the arrays and per-argument
+    /// type checks of ``invoke(_:on:)``, for a host that calls in very often
+    /// (native code compiled from another module that shares this one's
+    /// memory and table). `arguments` must hold one slot for each of the
+    /// function's parameters, of their types; `results` room for one for each
+    /// result. A function with v128 values, or a host function, takes the
+    /// checked path.
+    public func invokeUnchecked(
+        arguments: UnsafePointer<UInt64>?, results: UnsafeMutablePointer<UInt64>?,
+        on stack: inout ExecutionStack
+    ) throws {
+        let type = self.type
+        guard handle.isWasm, !type.parameters.contains(.v128), !type.results.contains(.v128) else {
+            let values = type.parameters.enumerated().map { (i, t) in UntypedValue(storage: arguments.unsafelyUnwrapped[i]).cast(to: t) }
+            let out = try handle.invoke(values, store: store, stack: &stack)
+            for (i, v) in out.enumerated() { results.unsafelyUnwrapped[i] = UntypedValue(v).storage }
+            return
+        }
+        try executeWasmUnchecked(
+            store: store, function: handle, type: type,
+            arguments: arguments, results: results, stack: &stack)
+    }
+
     @discardableResult
     public func callAsFunction(_ arguments: [Value] = []) throws -> [Value] {
         return try invoke(arguments)

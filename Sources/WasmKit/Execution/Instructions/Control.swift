@@ -1,3 +1,5 @@
+import _CWasmKit
+
 /// > Note:
 /// <https://webassembly.github.io/spec/core/exec/instructions.html#control-instructions>
 extension Execution {
@@ -126,6 +128,9 @@ extension Execution {
     }
 
     mutating func endOfExecution(sp: inout Sp, pc: Pc) throws -> (Pc, CodeSlot) {
+        #if (arch(i386) || arch(x86_64) || arch(arm) || arch(arm64) || arch(arm64_32)) && !$Embedded
+            if returnsToHost { return (pc, wasmkit_tc_halt_slot()) }
+        #endif
         throw EndOfExecution(sp: sp)
     }
 
