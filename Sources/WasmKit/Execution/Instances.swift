@@ -195,6 +195,16 @@ public struct Instance {
         self.store = store
     }
 
+    /// The instance's function at `index` in its module's function index
+    /// space (imports first), exported or not: for a host that resolves
+    /// functions by index (a symbol map, or a module split into parts
+    /// compiled differently whose direct calls it routes back here).
+    public func function(at index: Int) -> Function? {
+        let functions = handle.functions
+        guard index >= 0, index < functions.count else { return nil }
+        return Function(handle: functions[index], store: store)
+    }
+
     /// Finds an exported entity by name.
     ///
     /// - Parameter name: The name of the exported entity.
@@ -576,6 +586,39 @@ public struct Table: Equatable {
     /// The type of the table instance.
     public var type: TableType {
         handle.tableType
+    }
+
+    /// The number of elements the table holds now.
+    public var count: Int {
+        handle.withValue { $0.elements.count }
+    }
+
+    /// Grows the table by `delta` elements set to `value`, as `table.grow`
+    /// does, within the table's maximum and the store's resource limiter.
+    /// A host that places modules in a shared table (a dynamic loader) uses
+    /// it to make room for each one's functions.
+    ///
+    /// - Returns: The index of the first new element (the old count).
+    /// - Throws: `Trap` if the table cannot grow by `delta`.
+    @discardableResult
+    public func grow(by delta: Int, value: Reference = .function(nil), store: Store) throws -> Int {
+        let oldCount = count
+        guard delta >= 0,
+            try handle.withValue({
+                try $0.grow(by: UInt64(delta), value: value, resourceLimiter: store.resourceLimiter)
+            })
+        else {
+            throw Trap(.message(.init("table cannot grow by \(delta) from \(oldCount)")))
+        }
+        return oldCount
+    }
+
+    /// The function at `index` of a `funcref` table of `store`, or nil for a
+    /// null slot: what a host mirroring the table elsewhere (native code
+    /// that calls through a table of its own) needs, its type included.
+    public func function(at index: Int, store: Store) -> Function? {
+        guard index >= 0, index < count, case .function(let address?) = self[index] else { return nil }
+        return Function(handle: InternalFunction(bitPattern: address), store: store)
     }
 
     /// Accesses the element at the given index.
@@ -1086,6 +1129,27 @@ public struct Memory: Equatable {
     /// The current size of the memory in bytes.
     public var byteCount: Int {
         handle.withValue { $0.byteCount }
+    }
+
+    /// Grows the memory by `pageCount` pages, as `memory.grow` does.
+    ///
+    /// - Returns: The page count before growing, or -1 if it cannot grow.
+    public func grow(by pageCount: Int, store: Store) throws -> Int {
+        let old = try handle.withValue { try $0.grow(by: pageCount, resourceLimiter: store.resourceLimiter) }
+        switch old {
+        case .i32(let pages): return Int(Int32(bitPattern: pages))
+        case .i64(let pages): return Int(Int64(bitPattern: pages))
+        default: return -1
+        }
+    }
+
+    /// The address of the memory's first byte, and whether it stays there
+    /// as the memory grows (a reserved memory, `memoryBoundsChecking`
+    /// `.mprotect`), so code outside WasmKit can access the memory in place
+    /// (native code compiled from another module that shares it). A memory
+    /// that moves when it grows (malloc-backed) answers `stable` false.
+    public var unsafeBaseAddress: (address: UnsafeMutableRawPointer?, stable: Bool) {
+        handle.withValue { ($0.baseAddress, $0.trapGuardReservationSize > 0) }
     }
 }
 

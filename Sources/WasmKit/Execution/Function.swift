@@ -127,6 +127,13 @@ public struct Function: Equatable {
         store.allocator.funcTypeInterner.resolve(handle.type)
     }
 
+    /// The function as a reference, for a `funcref` table of the same store
+    /// (`Table`'s subscript): how a host places an export of one module in a
+    /// table another module calls through.
+    public var reference: Reference {
+        .function(from: handle)
+    }
+
     /// Invokes a function of the given address with the given parameters.
     ///
     /// - Parameters:
