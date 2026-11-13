@@ -17,6 +17,12 @@ struct Execution: ~Copyable {
     ///   Swift from passing it to `invoke` in registers, and every call instruction pays for that.
     private var trap: UnsafeMutablePointer<(error: UnsafeRawPointer, sp: Sp, pc: Pc)>? = nil
 
+    /// Whether the root frame's `endOfExecution` ends this execution by
+    /// halting the direct-threaded handler chain (`execute`), rather than by
+    /// throwing `EndOfExecution` (the token-threaded loop, a suspended or a
+    /// debugged execution, which catch it).
+    var returnsToHost = false
+
     /// The stack of active exception handlers for `try_table` blocks.
     var exceptionHandlers: [ExceptionHandler] = []
 
@@ -514,6 +520,40 @@ func executeWasm(
     }
 }
 
+/// As `executeWasm`, with the arguments and results as raw 64-bit slots
+/// (`UntypedValue`'s encoding: an i32 or f32 zero-extended, an i64 or f64 as
+/// is): no arrays, no per-argument type checks. For scalar types only (no
+/// v128, whose values take two slots).
+func executeWasmUnchecked(
+    store: Store,
+    function handle: InternalFunction,
+    type: FunctionType,
+    arguments: UnsafePointer<UInt64>?,
+    results: UnsafeMutablePointer<UInt64>?,
+    stack executionStack: inout ExecutionStack
+) throws {
+    let wasSuspendable = store.isSuspendable
+    store.isSuspendable = false
+    defer { store.isSuspendable = wasSuspendable }
+    let store = StoreRef(store)
+    try Execution.with(store: store, stack: &executionStack) { (execution, base) in
+        let parameterCount = type.parameters.count, resultCount = type.results.count
+        try ParameterAreaLayout.checkFitsVRegRange(max(parameterCount, resultCount))
+        let sp = base.advanced(by: StackLayout.numberOfSavingSlots)
+        sp.previousSP = nil
+        sp.currentFunction = nil
+        sp.returnPC = nil
+        for i in 0..<parameterCount { sp[i] = UntypedValue(storage: arguments.unsafelyUnwrapped[i]) }
+        try withUnsafeTemporaryAllocation(of: CodeSlot.self, capacity: 2) { rootISeq in
+            rootISeq[0] = Instruction.endOfExecution(.init()).headSlot(
+                threadingModel: store.value.engine.configuration.threadingModel
+            )
+            try execution.execute(sp: sp, pc: rootISeq.baseAddress!, handle: handle, type: type)
+        }
+        for i in 0..<resultCount { results.unsafelyUnwrapped[i] = sp[i].storage }
+    }
+}
+
 extension Execution {
     /// Lays out the root frame of a call to a function of `type` at `base`, the start of a stack,
     /// and returns the frame's stack pointer.
@@ -631,6 +671,7 @@ extension Execution {
         let sp: Sp
     }
 
+
     /// An ``Error`` thrown when a breakpoint is triggered.
     struct Breakpoint: Error, @unchecked Sendable {
         let sp: Sp
@@ -657,6 +698,9 @@ extension Execution {
         do {
             switch self.store.value.engine.configuration.threadingModel {
             case .direct:
+                // The root frame's endOfExecution halts the handler chain.
+                returnsToHost = true
+                defer { returnsToHost = false }
                 try runDirectThreaded(sp: sp, pc: pc, md: md, ms: ms)
             case .token:
                 try startTokenThreaded(sp: sp, pc: pc, md: md, ms: ms)
