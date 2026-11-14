@@ -127,9 +127,15 @@ public struct Function: Equatable {
         store.allocator.funcTypeInterner.resolve(handle.type)
     }
 
-    /// The function as a reference, for a `funcref` table of the same store
-    /// (`Table`'s subscript): how a host places an export of one module in a
-    /// table another module calls through.
+    /// The function as a `funcref` value: how a host places an export of one
+    /// module in a table another module calls through (``Table/subscript(_:)``
+    /// or ``Table/grow(by:value:store:)``).
+    ///
+    /// The reference names this function in this function's store and is
+    /// meaningful only there: put it only in a `funcref` table of the same
+    /// store. Read back with ``Table/function(at:store:)``, it gives this
+    /// function again (`==`). The reference keeps nothing alive; it is valid
+    /// for as long as the store is.
     public var reference: Reference {
         .function(from: handle)
     }
