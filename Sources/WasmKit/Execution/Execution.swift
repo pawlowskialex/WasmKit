@@ -671,7 +671,6 @@ extension Execution {
         let sp: Sp
     }
 
-
     /// An ``Error`` thrown when a breakpoint is triggered.
     struct Breakpoint: Error, @unchecked Sendable {
         let sp: Sp

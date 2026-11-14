@@ -172,20 +172,52 @@ public struct Function: Equatable {
     }
 
     /// Invokes the function with its arguments and results as raw 64-bit
-    /// slots (an i32 or f32 in the low bits, zero-extended; an i64 or f64 as
-    /// is), on a stack the caller owns: without the arrays and per-argument
-    /// type checks of ``invoke(_:on:)``, for a host that calls in very often
-    /// (native code compiled from another module that shares this one's
-    /// memory and table). `arguments` must hold one slot for each of the
-    /// function's parameters, of their types; `results` room for one for each
-    /// result. A function with v128 values, or a host function, takes the
-    /// checked path.
+    /// slots, on a stack the caller owns, without the `[Value]` arrays and
+    /// the per-argument type checks of ``invoke(_:on:)``: for a host that
+    /// calls in very often (native code compiled from another module that
+    /// shares this one's memory and table, calling back for each function
+    /// it doesn't have).
+    ///
+    /// A slot holds a value as the interpreter stores it: an i32 or f32 in
+    /// the low 32 bits with the high 32 bits zero, an i64 or f64 as its 64
+    /// bits, a reference as a reference of this function's store encodes
+    /// (what passing it through a `Value` would give).
+    ///
+    /// Nothing about the slots is checked, so the caller must guarantee:
+    ///
+    /// - `arguments` points to one initialized slot for each of the
+    ///   function's parameters (it may be nil only if there are none), each
+    ///   of its parameter's type, encoded as above;
+    /// - `results` points to room for one slot for each of the function's
+    ///   results (it may be nil only if there are none);
+    /// - the function's store is not in use on another thread for the
+    ///   duration of the call.
+    ///
+    /// If it doesn't, the behavior is undefined: the call reads or writes
+    /// past buffers with too few slots, an i32 or f32 slot with high bits set
+    /// may be read as another value, and a reference that isn't one of the
+    /// store's may be dereferenced by the guest. Use ``invoke(_:on:)`` where the
+    /// arguments come from anywhere that cannot be trusted to match the type.
+    ///
+    /// What the function itself does is as safe as with ``invoke(_:on:)``: a
+    /// trap, an exhausted stack or an uncaught exception throws, with the
+    /// same errors, leaves `results` as it was, and leaves `stack` usable for
+    /// later calls. A host function takes the checked path (its arguments
+    /// converted to `Value`s by the parameter types).
+    ///
+    /// - Throws: A `Trap` (or another error the guest or a host function
+    ///   raises) as ``invoke(_:on:)`` does, and a `Trap` without running
+    ///   anything for a signature with a v128 parameter or result, which a
+    ///   single slot cannot hold.
     public func invokeUnchecked(
         arguments: UnsafePointer<UInt64>?, results: UnsafeMutablePointer<UInt64>?,
         on stack: inout ExecutionStack
     ) throws {
         let type = self.type
-        guard handle.isWasm, !type.parameters.contains(.v128), !type.results.contains(.v128) else {
+        guard !type.parameters.contains(.v128), !type.results.contains(.v128) else {
+            throw Trap(.message(.init("invokeUnchecked cannot pass a v128 value in a 64-bit slot: use invoke")))
+        }
+        guard handle.isWasm else {
             let values = type.parameters.enumerated().map { (i, t) in UntypedValue(storage: arguments.unsafelyUnwrapped[i]).cast(to: t) }
             let out = try handle.invoke(values, store: store, stack: &stack)
             for (i, v) in out.enumerated() { results.unsafelyUnwrapped[i] = UntypedValue(v).storage }
