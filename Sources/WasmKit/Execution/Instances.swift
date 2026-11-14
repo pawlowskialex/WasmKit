@@ -196,9 +196,13 @@ public struct Instance {
     }
 
     /// The instance's function at `index` in its module's function index
-    /// space (imports first), exported or not: for a host that resolves
-    /// functions by index (a symbol map, or a module split into parts
-    /// compiled differently whose direct calls it routes back here).
+    /// space (imports first, then the module's own functions in order),
+    /// exported or not: for a host that resolves functions by index (a symbol
+    /// map, or a module split into parts compiled differently whose direct
+    /// calls it routes back here).
+    ///
+    /// - Returns: The function, or `nil` when `index` is negative or not
+    ///   below the number of functions in the index space.
     public func function(at index: Int) -> Function? {
         let functions = handle.functions
         guard index >= 0, index < functions.count else { return nil }
@@ -588,7 +592,9 @@ public struct Table: Equatable {
         handle.tableType
     }
 
-    /// The number of elements the table holds now.
+    /// The number of elements the table holds now: its current size, as
+    /// `table.size` answers. It changes when the guest or the host grows the
+    /// table.
     public var count: Int {
         handle.withValue { $0.elements.count }
     }
@@ -598,11 +604,23 @@ public struct Table: Equatable {
     /// A host that places modules in a shared table (a dynamic loader) uses
     /// it to make room for each one's functions.
     ///
+    /// - Parameters:
+    ///   - delta: The number of elements to add; zero leaves the table as it is.
+    ///   - value: What the new elements hold: null by default. Its kind must be
+    ///     the table's (a function reference for a `funcref` table, an extern
+    ///     reference for an `externref` one), and a function reference must be
+    ///     one of `store`'s (``Function/reference``).
+    ///   - store: The store the table belongs to; its resource limiter is asked.
     /// - Returns: The index of the first new element (the old count).
-    /// - Throws: `Trap` if the table cannot grow by `delta`.
+    /// - Throws: `Trap` if `delta` is negative, if the table's maximum or the
+    ///   resource limiter refuses the growth, or if `value` is of the wrong
+    ///   kind. The table is unchanged then.
     @discardableResult
     public func grow(by delta: Int, value: Reference = .function(nil), store: Store) throws -> Int {
         let oldCount = count
+        guard Self.reference(value, fits: type.elementType) else {
+            throw Trap(.message(.init("a \(value) cannot be stored in a table of \(type.elementType)")))
+        }
         guard delta >= 0,
             try handle.withValue({
                 try $0.grow(by: UInt64(delta), value: value, resourceLimiter: store.resourceLimiter)
@@ -613,12 +631,30 @@ public struct Table: Equatable {
         return oldCount
     }
 
-    /// The function at `index` of a `funcref` table of `store`, or nil for a
-    /// null slot: what a host mirroring the table elsewhere (native code
-    /// that calls through a table of its own) needs, its type included.
+    /// The function at `index` of a `funcref` table: what a host mirroring
+    /// the table elsewhere (native code that calls through a table of its
+    /// own) needs, its type included.
+    ///
+    /// - Parameter store: The store the table belongs to.
+    /// - Returns: The function, or `nil` for a null slot, an index out of the
+    ///   table's range, a table whose elements are not functions, or a `store`
+    ///   other than the table's.
     public func function(at index: Int, store: Store) -> Function? {
-        guard index >= 0, index < count, case .function(let address?) = self[index] else { return nil }
+        guard store.allocator === allocator, index >= 0, index < count,
+            case .function(let address?) = self[index]
+        else { return nil }
         return Function(handle: InternalFunction(bitPattern: address), store: store)
+    }
+
+    /// Whether `reference` is of the kind a table of `elementType` holds.
+    private static func reference(_ reference: Reference, fits elementType: ReferenceType) -> Bool {
+        switch (reference, elementType.heapType) {
+        case (.function, .abstract(.funcRef)), (.function, .concrete),
+            (.extern, .abstract(.externRef)), (.exception, .abstract(.exnRef)):
+            return true
+        default:
+            return false
+        }
     }
 
     /// Accesses the element at the given index.
@@ -1131,10 +1167,25 @@ public struct Memory: Equatable {
         handle.withValue { $0.byteCount }
     }
 
-    /// Grows the memory by `pageCount` pages, as `memory.grow` does.
+    /// Grows the memory by `pageCount` pages of 64 KiB, as `memory.grow`
+    /// does, within the memory's maximum and the store's resource limiter.
+    /// The new pages are zero.
     ///
-    /// - Returns: The page count before growing, or -1 if it cannot grow.
+    /// A memory whose ``unsafeBaseAddress`` is not `stable` may move when it
+    /// grows: read the address again afterwards. A guest that is running
+    /// (this called from a host function) sees the new size and address when
+    /// the host function returns.
+    ///
+    /// - Parameters:
+    ///   - pageCount: The number of pages to add; zero leaves the memory as it is.
+    ///   - store: The store the memory belongs to; its resource limiter is asked.
+    /// - Returns: The page count before growing, or -1 if it cannot grow (a
+    ///   negative `pageCount`, past the maximum, or refused by the resource
+    ///   limiter), in which case the memory is unchanged.
+    /// - Throws: An error the resource limiter throws, or a `Trap` if the host
+    ///   cannot allocate the larger memory.
     public func grow(by pageCount: Int, store: Store) throws -> Int {
+        guard pageCount >= 0 else { return -1 }
         let old = try handle.withValue { try $0.grow(by: pageCount, resourceLimiter: store.resourceLimiter) }
         switch old {
         case .i32(let pages): return Int(Int32(bitPattern: pages))
@@ -1144,10 +1195,27 @@ public struct Memory: Equatable {
     }
 
     /// The address of the memory's first byte, and whether it stays there
-    /// as the memory grows (a reserved memory, `memoryBoundsChecking`
-    /// `.mprotect`), so code outside WasmKit can access the memory in place
-    /// (native code compiled from another module that shares it). A memory
-    /// that moves when it grows (malloc-backed) answers `stable` false.
+    /// as the memory grows, so code outside WasmKit can access the memory in
+    /// place (native code compiled from another module that shares it).
+    ///
+    /// `stable` is true when the engine reserved address space for the
+    /// memory's whole range up front and grows it in place: a shared memory,
+    /// or a 32-bit memory under `memoryBoundsChecking` `.mprotect` on macOS,
+    /// iOS or Linux (unless the reservation failed and the engine fell back).
+    /// Then `address` stays the same for as long as the memory exists, and
+    /// the bytes from it up to ``byteCount`` are the memory's; the reservation
+    /// past them is inaccessible. `stable` is false for a memory the engine
+    /// allocated with malloc (software bounds checking, a memory64, or the
+    /// fallback): `address` is then valid only until the memory next grows,
+    /// by the guest's `memory.grow` or by ``grow(by:store:)``, which may move
+    /// the bytes and free the old allocation. Ask again after anything that
+    /// may have grown it.
+    ///
+    /// The pointer is unsafe in every case: WasmKit does not bounds-check
+    /// accesses through it, does not keep the memory alive for it (it dangles
+    /// once the memory's store is gone), and does not synchronize it with a
+    /// guest running on another thread. `address` may be nil for a memory of
+    /// zero bytes that has no allocation.
     public var unsafeBaseAddress: (address: UnsafeMutableRawPointer?, stable: Bool) {
         handle.withValue { ($0.baseAddress, $0.trapGuardReservationSize > 0) }
     }
