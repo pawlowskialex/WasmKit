@@ -93,6 +93,9 @@ static void wasmkit_install_signal_handlers_once(void) {
   // SA_ONSTACK: use alternate signal stack if available (via sigaltstack),
   // preventing infinite handler recursion when SA_NODEFER is set and
   // the handler itself faults (e.g. due to stack overflow).
+  // SA_NODEFER and the empty sa_mask also keep the thread's signal mask as it
+  // was across a trap, which wasmkit_trap_guard_run relies on: its
+  // sigsetjmp saves no mask for siglongjmp to restore.
   action.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
 
   if (sigaction(SIGSEGV, &action, &wasmkit_prev_segv) == 0) {
@@ -114,11 +117,13 @@ bool wasmkit_trap_guard_run(wasmkit_trap_guard_fn fn, void *ctx) {
   wasmkit_trap_guard_t *previous_guard = wasmkit_current_trap_guard;
 
   wasmkit_current_trap_guard = &guard;
-  // No signal mask to save: the handler is installed with SA_NODEFER, so a
-  // trap jumps back with the mask it found, and saving it (and, on Darwin,
-  // the alternate signal stack) costs two system calls on every entry into
-  // the guest, which a host calling in often (re-entrantly, from native
-  // code compiled from another module) pays on each call.
+  // No signal mask to save: the handler is installed with SA_NODEFER and an
+  // empty sa_mask, so delivering the fault blocks nothing and a trap jumps
+  // back with the mask it found (InvokeUncheckedTests checks that it does).
+  // Saving it (and, on Darwin, the alternate signal stack) costs two system
+  // calls on every entry into the guest, which a host calling in often
+  // (re-entrantly, from native code compiled from another module) pays on
+  // each call. Keep the handler's flags in step with this.
   int jmp = sigsetjmp(guard.env, 0);
   if (jmp == 0) {
     fn(ctx);
