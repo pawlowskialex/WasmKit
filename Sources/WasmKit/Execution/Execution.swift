@@ -17,6 +17,12 @@ struct Execution: ~Copyable {
     ///   Swift from passing it to `invoke` in registers, and every call instruction pays for that.
     private var trap: UnsafeMutablePointer<(error: UnsafeRawPointer, sp: Sp, pc: Pc)>? = nil
 
+    /// Whether the root frame's `endOfExecution` ends this execution by
+    /// halting the direct-threaded handler chain (`execute`), rather than by
+    /// throwing `EndOfExecution` (the token-threaded loop, a suspended or a
+    /// debugged execution, which catch it).
+    var returnsToHost = false
+
     /// The stack of active exception handlers for `try_table` blocks.
     var exceptionHandlers: [ExceptionHandler] = []
 
@@ -663,6 +669,9 @@ extension Execution {
         do {
             switch self.store.value.engine.configuration.threadingModel {
             case .direct:
+                // The root frame's endOfExecution halts the handler chain.
+                returnsToHost = true
+                defer { returnsToHost = false }
                 try runDirectThreaded(sp: sp, pc: pc, md: md, ms: ms)
             case .token:
                 try startTokenThreaded(sp: sp, pc: pc, md: md, ms: ms)
