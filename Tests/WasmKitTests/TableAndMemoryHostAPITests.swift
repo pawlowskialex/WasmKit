@@ -5,8 +5,8 @@ import WasmParser
 @_spi(Fuzzing) @testable import WasmKit
 
 /// What a host does to tables and memories from outside the guest: `Table.count`,
-/// `Table.grow(by:value:store:)`, `Table.function(at:store:)`, `Function.reference` and
-/// `Memory.grow(by:store:)`.
+/// `Table.grow(by:value:store:)`, `Table.function(at:store:)`, `Function.reference`,
+/// `Memory.grow(by:store:)`, `Memory.unsafeBaseAddress` and `Memory.isBaseAddressStable`.
 @Suite
 struct TableAndMemoryHostAPITests {
     /// A module with a `funcref` table of 2 (at most 4) elements and functions that read it.
@@ -343,6 +343,87 @@ struct TableAndMemoryHostAPITests {
         #expect(try run() == [.i32(1333)])
         #expect(memory?.byteCount == 2 * 65536)
     }
+
+    // MARK: - Memory.unsafeBaseAddress and isBaseAddressStable
+
+    @Test
+    func unsafeBaseAddressOfAMallocBackedMemoryIsNotStableAndMayMove() throws {
+        let store = Store(engine: Engine(configuration: .init(memoryBoundsChecking: .software)))
+        let instance = try parseWasm(bytes: wat2wasm(Self.memoryModule)).instantiate(store: store)
+        let memory = try #require(instance.exports[memory: "memory"])
+        let storeFunction = try #require(instance.exports[function: "store"])
+        let load = try #require(instance.exports[function: "load"])
+
+        let base = try #require(memory.unsafeBaseAddress)
+        #expect(memory.isBaseAddressStable == false)
+        // The address is the guest's byte 0, both ways.
+        try storeFunction([.i32(32), .i32(0x1122_3344)])
+        #expect(base.load(fromByteOffset: 32, as: UInt32.self) == 0x1122_3344)
+        base.storeBytes(of: 0x5566_7788, toByteOffset: 64, as: UInt32.self)
+        #expect(try load([.i32(64)]) == [.i32(0x5566_7788)])
+
+        #expect(try memory.grow(by: 1, store: store) == 1)
+        #expect(memory.isBaseAddressStable == false)
+        let newBase = try #require(memory.unsafeBaseAddress)
+        // A malloc-backed memory is copied into a new allocation when it grows, made before the old
+        // one is freed, so today it always moves: why `isBaseAddressStable` is false and the old address must not
+        // be used again.
+        #expect(newBase != base)
+        #expect(newBase.load(fromByteOffset: 32, as: UInt32.self) == 0x1122_3344)
+        #expect(newBase.load(fromByteOffset: 64, as: UInt32.self) == 0x5566_7788)
+        try storeFunction([.i32(65536), .i32(5)])
+        #expect(newBase.load(fromByteOffset: 65536, as: UInt32.self) == 5)
+    }
+
+    #if os(macOS) || os(iOS) || os(Linux)
+        @Test(.enabled(if: !Engine.isAddressSanitizerEnabled))
+        func unsafeBaseAddressOfAReservedMemoryIsStable() throws {
+            let store = Store(engine: Engine(configuration: .init(memoryBoundsChecking: .mprotect)))
+            let instance = try parseWasm(bytes: wat2wasm(Self.memoryModule)).instantiate(store: store)
+            let memory = try #require(instance.exports[memory: "memory"])
+            let storeFunction = try #require(instance.exports[function: "store"])
+
+            // `isBaseAddressStable` answers what the engine did: it reserved the memory's range.
+            #expect(memory.isBaseAddressStable == (memory.handle.withValue { $0.trapGuardReservationSize } > 0))
+            #expect(memory.isBaseAddressStable)
+            let base = try #require(memory.unsafeBaseAddress)
+            try storeFunction([.i32(32), .i32(0xCAFE)])
+
+            #expect(try memory.grow(by: 2, store: store) == 1)
+            #expect(memory.isBaseAddressStable)
+            #expect(memory.unsafeBaseAddress == base)
+            #expect(base.load(fromByteOffset: 32, as: UInt32.self) == 0xCAFE)
+            // The grown pages are usable through the same address.
+            try storeFunction([.i32(2 * 65536), .i32(77)])
+            #expect(base.load(fromByteOffset: 2 * 65536, as: UInt32.self) == 77)
+        }
+
+        @Test(.enabled(if: !Engine.isAddressSanitizerEnabled))
+        func unsafeBaseAddressOfAMemory64IsNotStableUnderMprotect() throws {
+            // The engine reserves only 32-bit memories; a memory64 is malloc-backed whatever the
+            // configuration asks, and `isBaseAddressStable` says so.
+            let features: WasmFeatureSet = [.memory64]
+            let store = Store(engine: Engine(configuration: .init(features: features, memoryBoundsChecking: .mprotect)))
+            let module = try parseWasm(
+                bytes: wat2wasm("(module (memory (export \"memory\") i64 1 2))", features: features),
+                features: features)
+            let memory = try #require(try module.instantiate(store: store).exports[memory: "memory"])
+            #expect(memory.isBaseAddressStable == false)
+            #expect(memory.unsafeBaseAddress != nil)
+        }
+
+        @Test(.enabled(if: !Engine.isAddressSanitizerEnabled))
+        func unsafeBaseAddressOfASharedMemoryIsStable() throws {
+            let features: WasmFeatureSet = [.threads]
+            let store = Store(engine: Engine(configuration: .init(features: features)))
+            let memory = try WasmKit.Memory(store: store, type: MemoryType(min: 1, max: 4, shared: true))
+            let before = memory.unsafeBaseAddress
+            #expect(memory.isBaseAddressStable)
+            #expect(try memory.grow(by: 3, store: store) == 1)
+            #expect(memory.unsafeBaseAddress == before)
+            #expect(throws: Trap.self) { try memory.grow(by: 1, store: store) }
+        }
+    #endif
 
     static var boundsCheckingModes: [EngineConfiguration.MemoryBoundsChecking] {
         #if os(macOS) || os(iOS) || os(Linux)

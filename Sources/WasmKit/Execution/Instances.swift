@@ -1159,9 +1159,8 @@ public struct Memory: Equatable {
     /// does, within the memory's maximum and the store's resource limiter.
     /// The new pages are zero.
     ///
-    /// Growing may move the memory's bytes (unless the engine reserved its
-    /// whole range up front), so a pointer from ``withUnsafeMutableBufferPointer(body:)``
-    /// must not be kept across it. A guest that is running (this called from a host
+    /// Growing may move the memory's bytes unless ``isBaseAddressStable``,
+    /// so a pointer into the memory must not be kept across it. A guest that is running (this called from a host
     /// function) sees the new size when the host function returns.
     ///
     /// - Parameters:
@@ -1189,6 +1188,36 @@ public struct Memory: Equatable {
             throw Trap(.message(.init("memory cannot grow by \(pageCount) pages from \(oldPageCount)")))
         }
         return previous
+    }
+
+    /// The address of the memory's first byte, for code outside WasmKit that
+    /// reads and writes the memory in place across calls (native code that
+    /// shares the memory with the guest), where
+    /// ``withUnsafeMutableBufferPointer(body:)``'s scope is too narrow.
+    ///
+    /// The address stays valid as long as the memory exists if
+    /// ``isBaseAddressStable`` is true. Otherwise it is valid only until the
+    /// memory next grows (by the guest's `memory.grow` or by
+    /// ``grow(by:store:)``), which may move the bytes and free the old
+    /// allocation: read it again after anything that may have grown the memory.
+    ///
+    /// The bytes from the address up to ``byteCount`` are the memory's.
+    /// Nothing about the pointer is checked or synchronized: WasmKit does not
+    /// bounds-check accesses through it, does not keep the memory alive for it,
+    /// and does not order them with a guest running on another thread. It may
+    /// be nil for a memory of zero bytes.
+    public var unsafeBaseAddress: UnsafeMutableRawPointer? {
+        handle.withValue { $0.baseAddress }
+    }
+
+    /// Whether ``unsafeBaseAddress`` stays the same as the memory grows: true
+    /// when the engine reserved address space for the memory's whole range up
+    /// front and grows it in place (a shared memory, or a 32-bit memory under
+    /// ``EngineConfiguration/MemoryBoundsChecking/mprotect`` where the
+    /// reservation succeeded), false for a memory it allocates and reallocates
+    /// as it grows.
+    public var isBaseAddressStable: Bool {
+        handle.withValue { $0.trapGuardReservationSize > 0 }
     }
 }
 
