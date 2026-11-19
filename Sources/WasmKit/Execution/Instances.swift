@@ -578,6 +578,73 @@ public struct Table: Equatable {
         handle.tableType
     }
 
+    /// The number of elements the table holds now: its current size, as
+    /// `table.size` answers. It changes when the guest or the host grows the
+    /// table.
+    public var count: Int {
+        handle.withValue { $0.elements.count }
+    }
+
+    /// Grows the table by `delta` elements set to `value`, as `table.grow`
+    /// does, within the table's maximum and the store's resource limiter:
+    /// how a host makes room for functions it places in a table (a dynamic
+    /// loader adding a module's functions to the table its modules share, for one).
+    ///
+    /// - Parameters:
+    ///   - delta: The number of elements to add; zero leaves the table as it is.
+    ///   - value: What the new elements hold: null by default. Its kind must be
+    ///     the table's (a function reference for a `funcref` table, an extern
+    ///     reference for an `externref` one), and a function reference must be
+    ///     one of `store`'s (``Function/reference``). A table of a concrete
+    ///     function type takes only null here, as nothing checks a function's
+    ///     type against it.
+    ///   - store: The store the table belongs to; its resource limiter is asked.
+    /// - Returns: The index of the first new element (the old count).
+    /// - Throws: `Trap` if `delta` is negative, if the table's maximum or the
+    ///   resource limiter refuses the growth, or if `value` is of the wrong
+    ///   kind. The table is unchanged then.
+    @discardableResult
+    public func grow(by delta: Int, value: Reference = .function(nil), store: Store) throws -> Int {
+        let oldCount = count
+        guard Self.reference(value, fits: type.elementType) else {
+            throw Trap(.message(.init("a \(value) cannot be stored in a table of \(type.elementType)")))
+        }
+        guard delta >= 0,
+            try handle.withValue({
+                try $0.grow(by: UInt64(delta), value: value, resourceLimiter: store.resourceLimiter)
+            })
+        else {
+            throw Trap(.message(.init("table cannot grow by \(delta) from \(oldCount)")))
+        }
+        return oldCount
+    }
+
+    /// The function at `index` of a function table, as a ``Function`` (with
+    /// its ``Function/type``) rather than the ``Reference`` the subscript
+    /// gives.
+    ///
+    /// - Parameter store: The store the table belongs to.
+    /// - Returns: The function, or `nil` for a null slot, an index out of the
+    ///   table's range, a table whose elements are not functions, or a `store`
+    ///   other than the table's.
+    public func function(at index: Int, store: Store) -> Function? {
+        guard store.allocator === allocator, index >= 0, index < count,
+            case .function(let address?) = self[index]
+        else { return nil }
+        return Function(handle: InternalFunction(bitPattern: address), store: store)
+    }
+
+    /// Whether `reference` is of the kind a table of `elementType` holds.
+    private static func reference(_ reference: Reference, fits elementType: ReferenceType) -> Bool {
+        switch (reference, elementType.heapType) {
+        case (.function, .abstract(.funcRef)), (.function(.none), .concrete),
+            (.extern, .abstract(.externRef)), (.exception, .abstract(.exnRef)):
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Accesses the element at the given index.
     public subscript(index: Int) -> Reference {
         get { handle.withValue { $0.reference(at: index) } }
@@ -1086,6 +1153,42 @@ public struct Memory: Equatable {
     /// The current size of the memory in bytes.
     public var byteCount: Int {
         handle.withValue { $0.byteCount }
+    }
+
+    /// Grows the memory by `pageCount` pages of 64 KiB, as `memory.grow`
+    /// does, within the memory's maximum and the store's resource limiter.
+    /// The new pages are zero.
+    ///
+    /// Growing may move the memory's bytes (unless the engine reserved its
+    /// whole range up front), so a pointer from ``withUnsafeMutableBufferPointer(body:)``
+    /// must not be kept across it. A guest that is running (this called from a host
+    /// function) sees the new size when the host function returns.
+    ///
+    /// - Parameters:
+    ///   - pageCount: The number of pages to add; zero leaves the memory as it is.
+    ///   - store: The store the memory belongs to; its resource limiter is asked.
+    /// - Returns: The number of pages before growing.
+    /// - Throws: `Trap` if `pageCount` is negative, if growing would pass the
+    ///   memory's maximum, or if the resource limiter refuses it (the memory is
+    ///   unchanged then); an error the resource limiter throws; or a `Trap` if the
+    ///   host cannot allocate the larger memory.
+    @discardableResult
+    public func grow(by pageCount: Int, store: Store) throws -> Int {
+        let oldPageCount = byteCount / MemoryEntity.pageSize
+        guard pageCount >= 0 else {
+            throw Trap(.message(.init("memory cannot grow by a negative page count (\(pageCount))")))
+        }
+        let result = try handle.withValue { try $0.grow(by: pageCount, resourceLimiter: store.resourceLimiter) }
+        let previous: Int
+        switch result {
+        case .i32(let pages): previous = Int(Int32(bitPattern: pages))
+        case .i64(let pages): previous = Int(Int64(bitPattern: pages))
+        default: previous = -1
+        }
+        guard previous >= 0 else {
+            throw Trap(.message(.init("memory cannot grow by \(pageCount) pages from \(oldPageCount)")))
+        }
+        return previous
     }
 }
 

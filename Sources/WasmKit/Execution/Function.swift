@@ -127,6 +127,19 @@ public struct Function: Equatable {
         store.allocator.funcTypeInterner.resolve(handle.type)
     }
 
+    /// The function as a `funcref` value, to place in a table
+    /// (``Table/subscript(_:)``, ``Table/grow(by:value:store:)``) or pass as a
+    /// reference argument.
+    ///
+    /// The reference names this function within its store and means nothing
+    /// in another: use it only in a table of the same store. Read back from a
+    /// table with ``Table/function(at:store:)``, it gives this function again.
+    /// The reference does not keep anything alive; it is valid as long as the
+    /// store is.
+    public var reference: Reference {
+        .function(from: handle)
+    }
+
     /// Invokes a function of the given address with the given parameters.
     ///
     /// - Parameters:
