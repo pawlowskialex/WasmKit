@@ -526,13 +526,41 @@ func executeWasm(
     }
 }
 
+/// As above, with the arguments and the results in buffers the caller owns.
+func executeWasm(
+    store: Store,
+    function handle: InternalFunction,
+    type: FunctionType,
+    arguments: UnsafeBufferPointer<Value>,
+    results: UnsafeMutableBufferPointer<Value>,
+    stack executionStack: inout ExecutionStack
+) throws {
+    let wasSuspendable = store.isSuspendable
+    store.isSuspendable = false
+    defer { store.isSuspendable = wasSuspendable }
+    // NOTE: `store` variable must not outlive this function
+    let store = StoreRef(store)
+    try Execution.with(store: store, stack: &executionStack) { (execution, base) in
+        let sp = try Execution.layOutRootFrame(at: base, type: type, arguments: arguments)
+        try withUnsafeTemporaryAllocation(of: CodeSlot.self, capacity: 2) { rootISeq in
+            rootISeq[0] = Instruction.endOfExecution(.init()).headSlot(
+                threadingModel: store.value.engine.configuration.threadingModel
+            )
+            try execution.execute(sp: sp, pc: rootISeq.baseAddress!, handle: handle, type: type)
+        }
+        Execution.readRootResults(sp: sp, type: type, into: results)
+    }
+}
+
 extension Execution {
     /// Lays out the root frame of a call to a function of `type` at `base`, the start of a stack,
     /// and returns the frame's stack pointer.
     ///
     /// The root frame has no function and no caller. Its parameter area, where the callee reads
     /// its arguments from and writes its results to, starts at the returned pointer.
-    static func layOutRootFrame(at base: Sp, type: FunctionType, arguments: [Value]) throws -> Sp {
+    static func layOutRootFrame<Arguments: Collection<Value>>(
+        at base: Sp, type: FunctionType, arguments: Arguments
+    ) throws -> Sp {
         // Advance the stack pointer to be able to reference negative indices
         // for saving slots.
         let sp = base.advanced(by: StackLayout.numberOfSavingSlots)
@@ -542,12 +570,21 @@ extension Execution {
         sp.previousSP = nil
         sp.currentFunction = nil
         sp.returnPC = nil
-        let layout = ParameterAreaLayout(type: type)
-        try ParameterAreaLayout.checkFitsVRegRange(layout.size)
-        for (index, argument) in arguments.enumerated() {
-            sp.storeValue(argument, at: layout.paramReg(index), type: type.parameters[index])
+        // The parameter area as `ParameterAreaLayout` lays it out, with the offsets computed in
+        // place rather than in arrays of their own: this runs on every call from the host.
+        try ParameterAreaLayout.checkFitsVRegRange(
+            max(Self.slotCount(of: type.parameters), Self.slotCount(of: type.results)))
+        var slot = 0
+        for (argument, parameterType) in zip(arguments, type.parameters) {
+            sp.storeValue(argument, at: VReg(slotIndex: slot), type: parameterType)
+            slot += parameterType.stackSlotCount
         }
         return sp
+    }
+
+    /// The number of slots values of `types` take in a parameter area.
+    static func slotCount(of types: [ValueType]) -> Int {
+        types.reduce(into: 0) { $0 += $1.stackSlotCount }
     }
 
     /// The code a root frame returns to: a lone `endOfExecution`, in memory of its own so that a
@@ -572,9 +609,19 @@ extension Execution {
 
     /// Reads the results a call of `type` left in the root frame at `sp`.
     static func readRootResults(sp: Sp, type: FunctionType) -> [Value] {
-        let layout = ParameterAreaLayout(type: type)
-        return type.results.enumerated().map { (i, resultType) in
-            sp.loadValue(at: layout.resultReg(i), type: resultType)
+        [Value](unsafeUninitializedCapacity: type.results.count) { buffer, count in
+            readRootResults(sp: sp, type: type, into: buffer)
+            count = type.results.count
+        }
+    }
+
+    /// Writes the results a call of `type` left in the root frame at `sp` to `results`, which has
+    /// room for exactly as many.
+    static func readRootResults(sp: Sp, type: FunctionType, into results: UnsafeMutableBufferPointer<Value>) {
+        var slot = 0
+        for (index, resultType) in type.results.enumerated() {
+            results.initializeElement(at: index, to: sp.loadValue(at: VReg(slotIndex: slot), type: resultType))
+            slot += resultType.stackSlotCount
         }
     }
 

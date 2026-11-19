@@ -158,6 +158,32 @@ public struct Function: Equatable {
         return try handle.invoke(arguments, store: store, stack: &stack)
     }
 
+    /// Invokes the function with its arguments read from, and its results
+    /// written to, buffers the caller owns, on a stack the caller owns: for a
+    /// host that calls in often (a loop's every tick, or native code calling
+    /// back for each function it doesn't have), ``invoke(_:on:)`` without the
+    /// arrays it allocates for every call. Host functions are called with the
+    /// buffers as their ``RawImplementation`` takes them.
+    ///
+    /// The arguments are checked as ``invoke(_:on:)`` checks them. A trap, an
+    /// exhausted stack or an uncaught exception throws as it does there, leaves
+    /// `results` as it was, and leaves `stack` usable for later calls.
+    ///
+    /// - Parameters:
+    ///   - arguments: One value for each of the function's parameters, of its type.
+    ///   - results: Room for exactly one value for each of the function's results.
+    ///   - stack: The stack to run the function on.
+    /// - Throws: A `Trap` if `arguments` don't match the function's parameters
+    ///   or `results` has room for another number of values (without running
+    ///   anything), or whatever the call itself throws.
+    public func invoke(
+        _ arguments: UnsafeBufferPointer<Value>,
+        into results: UnsafeMutableBufferPointer<Value>,
+        on stack: inout ExecutionStack
+    ) throws {
+        try handle.invoke(arguments, into: results, store: store, stack: &stack)
+    }
+
     @discardableResult
     public func callAsFunction(_ arguments: [Value] = []) throws -> [Value] {
         return try invoke(arguments)
@@ -249,6 +275,38 @@ extension InternalFunction {
         }
     }
 
+    func invoke(
+        _ arguments: UnsafeBufferPointer<Value>, into results: UnsafeMutableBufferPointer<Value>,
+        store: Store, stack: inout ExecutionStack
+    ) throws {
+        let resolvedType = store.engine.resolveType(isWasm ? wasm.type : host.type)
+        guard check(expectedTypes: resolvedType.parameters, values: arguments) else {
+            throw Trap(.parameterTypesMismatch(expected: resolvedType.parameters, got: Array(arguments)))
+        }
+        guard results.count == resolvedType.results.count else {
+            throw Trap(
+                .message(
+                    .init("room for \(results.count) results, but the function returns \(resolvedType.results.count)")))
+        }
+        if isWasm {
+            try executeWasm(
+                store: store, function: self, type: resolvedType,
+                arguments: arguments, results: results, stack: &stack)
+        } else {
+            // A host function does not run on the guest stack at all. Its results go to a buffer of
+            // its own first, so that a call that fails the result check leaves `results` alone.
+            let caller = Caller(instanceHandle: nil, store: store)
+            try withUnsafeTemporaryAllocation(of: Value.self, capacity: results.count) { out in
+                out.initialize(repeating: .i32(0))
+                try host.implementation(caller, arguments, out)
+                guard check(expectedTypes: resolvedType.results, values: UnsafeBufferPointer(out)) else {
+                    throw Trap(.resultTypesMismatch(expected: resolvedType.results, got: Array(out)))
+                }
+                _ = results.update(fromContentsOf: out)
+            }
+        }
+    }
+
     func invokeHost(_ arguments: [Value], store: Store) throws -> [Value] {
         let entity = host
         let resolvedType = store.engine.resolveType(entity.type)
@@ -265,7 +323,7 @@ extension InternalFunction {
         return results
     }
 
-    private func check(expectedTypes: [ValueType], values: [Value]) -> Bool {
+    private func check<Values: Collection<Value>>(expectedTypes: [ValueType], values: Values) -> Bool {
         guard expectedTypes.count == values.count else { return false }
         return zip(values, expectedTypes).allSatisfy { $0.matches($1) }
     }
